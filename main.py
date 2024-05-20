@@ -3,15 +3,14 @@ import sys
 import signal
 import argparse
 import requests
-# import subprocess
 import configparser
 import time
 import hashlib
 import pylast
-# import mpv
 import json
 import random
 import threading
+import urllib.parse
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -38,14 +37,6 @@ track_passed = False
 artist_aborted = False
 next_searched = False
 new_track = False
-
-# INVIDIOUS_MIRRORS_URLS = [
-#         'https://invidious.privacyredirect.com',
-#         'https://inv.oikei.net',
-#         'https://inv.us.projectsegfau.lt',
-#         'https://yewtu.be',
-#         'https://inv.us.projectsegfau.lt'
-#         ]
 
 def signal_handler(sig, frame):
     print("\nExiting...")
@@ -93,7 +84,7 @@ def search_track(query):
 
         total_tracks += tracks
         for i, track in enumerate(tracks, start=1):
-            print(f"{i + current_index}.{track['name']} be {track['artist']}")
+            print(f"{i + current_index}.{track['name']} by {track['artist']}")
 
         choice = input("Enter the number of the track you want to play or 'n' for the next page... ")
         if choice.lower() == 'n':
@@ -242,6 +233,105 @@ def get_track_album(artist, track):
         album = None
     return album
 
+def get_text_and_chords(artist, track, site):
+    track_href = ""
+    artist = artist.lower().replace("ё", "е")
+    track = track.lower().replace("ё", "е")
+    print(f"Find by {site}")
+    artist_link = get_artist_link(artist, site)
+    if not artist_link:
+        artist_words = artist.split()
+        if len(artist_words) > 1:
+            artist_reversed = ' '.join(reversed(artist_words))
+            artist_link = get_artist_link(artist_reversed, site)
+            if not artist_link:
+                return None
+        else:
+            return None
+
+    artist_url = f"https://www.muzbar.ru{artist_link}"
+    if site == "oduvanchik":
+        artist_url = f"https://www.oduvanchik.net/{artist_link}"
+
+    print(artist_url)
+    response = requests.get(artist_url)
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.content, 'html.parser')
+        table = soup.find('table', class_='tabs_table')
+        if site == "oduvanchik":
+            table = soup.find('div', class_='text')
+
+        links = table.find_all('a', href=lambda href: href and 'view_song' in href)
+        for link in links:
+            link_text = link.get_text(strip=True)
+            link_text = link_text.lower().replace("ё", "е")
+            if link_text == track:
+                track_link = link
+                if track_link:
+                    track_href = track_link.get('href')
+    if track_href:
+        track_url = f"https://www.muzbar.ru{track_href}"
+        if site == "oduvanchik":
+            track_url = f"https://www.oduvanchik.net/{track_href}"
+        print(track_url)
+        response = requests.get(track_url)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            text_and_chords_div = soup.find('div', class_='chords')
+            if text_and_chords_div:
+                pre_tags = text_and_chords_div.find_all('pre')
+            if site == "oduvanchik":
+                pre_tags = soup.find_all('pre')
+            text_and_chords = '\n\n'.join(pre_tag.get_text(strip=True) for pre_tag in pre_tags)
+            return text_and_chords
+    else:
+        return None
+
+def get_artist_link(artist, site):
+    letter = artist[0]
+    if site == "oduvanchik":
+        letter = letter.upper()
+        letter_bytes = letter.encode('cp1251')
+        letter_hex = letter_bytes.hex().upper()
+        letter = urllib.parse.quote_plus('{}'.format(letter_hex))
+    if letter.isdigit():
+        letter = "other"
+        if site == "oduvanchik":
+            letter = "0-9"
+
+    letter_url = f"https://www.muzbar.ru/tabs/?letter={letter}"
+    if site == "oduvanchik":
+        letter_url = f"https://www.oduvanchik.net/art_ltr.php?id=%{letter}"
+
+    response = requests.get(letter_url)
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.content, 'html.parser')
+        media_bodies = soup.find_all('div', class_='media-body')
+        for media_body in media_bodies:
+            link = media_body.find('a')
+            if link:
+                link_text = link.get_text(strip=True)
+                link_text = link_text.lower().replace("ё", "е")
+                if link_text == artist:
+                    artist_link = link
+                    if artist_link:
+                        artist_href = artist_link.get('href')
+                        return artist_href
+        if site == "oduvanchik":
+            artists_table_div = soup.find('div', class_='text')
+            if artists_table_div:
+                artists_table = artists_table_div.find('table')
+                if artists_table:
+                    links = artists_table.find_all('a')
+                    for link in links:
+                        link_text = link.get_text(strip=True)
+                        link_text = link_text.lower().replace("ё", "е")
+                        if link_text == artist:
+                            artist_link = link
+                            if artist_link:
+                                artist_href = artist_link.get('href')
+                                return artist_href
+
 def play_track(track):
     global track_finished, track_passed, artist_aborted, next_searched, new_track
     while True:
@@ -262,6 +352,11 @@ def play_track(track):
         input_thread.start()
         if not new_track:
             users_track_info(artist_name, track['name'])
+
+        text_and_chords = get_text_and_chords(artist_name, track['name'], "muzbar")
+        if not text_and_chords:
+            text_and_chords = get_text_and_chords(artist_name, track['name'], "oduvanchik")
+        print(text_and_chords)
 
         while not track_finished:
             update_now_playing(artist_name, track['name'], album)
