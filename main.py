@@ -11,10 +11,13 @@ import json
 import random
 import threading
 import urllib.parse
+import unicodedata
+import pydoc
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from collections import OrderedDict
+from transliterate import translit
 
 load_dotenv()
 api_key = os.getenv("LASTFM_API_KEY")
@@ -37,6 +40,8 @@ track_passed = False
 artist_aborted = False
 next_searched = False
 new_track = False
+chords_modified = False
+tonality = 0
 
 def signal_handler(sig, frame):
     print("\nExiting...")
@@ -143,7 +148,9 @@ def search_track(query):
 
 def add_to_played_tracks(artist, track, scrobbled):
     key = f"{artist} - {track}"
-    print("before: ", played_tracks)
+    if artist and track:
+        key = key.lower()
+    # print("before: ", played_tracks)
     if len(played_tracks) < 1:
         played_tracks[key] = 1
         return
@@ -154,15 +161,14 @@ def add_to_played_tracks(artist, track, scrobbled):
         played_tracks[key] = 1
     if not scrobbled:
         played_tracks.move_to_end(key, last=False)
-    print("after: ", played_tracks)
+    # print("after: ", played_tracks)
 
 def get_previous_track():
-    #print(played_tracks)
     if len(played_tracks):
         keys = list(played_tracks.keys())
         previous_key = keys[-1]
         previous_value = played_tracks[previous_key]
-        artist, track = previous_key.split(" - ")
+        artist, track = previous_key.split(" - ", 1)
 
         data = {
                 'name': track,
@@ -252,20 +258,26 @@ def get_text_and_chords(artist, track, site):
     artist_url = f"https://www.muzbar.ru{artist_link}"
     if site == "oduvanchik":
         artist_url = f"https://www.oduvanchik.net/{artist_link}"
+    elif site == "mytabs":
+        artist_url = f"https://mytabs.ru{artist_link}"
 
-    print(artist_url)
+    print("Artist's url is found: ",artist_url)
     response = requests.get(artist_url)
     if response.status_code == 200:
         soup = BeautifulSoup(response.content, 'html.parser')
-        table = soup.find('table', class_='tabs_table')
         if site == "oduvanchik":
             table = soup.find('div', class_='text')
-
-        links = table.find_all('a', href=lambda href: href and 'view_song' in href)
+            links = table.find_all('a', href=lambda href: href and 'view_song' in href)
+        elif site == "mytabs":
+            table = soup.find('div', class_='table-responsive')
+            links = table.find_all('a', class_='songtitle')
+        else:
+            table = soup.find('table', class_='tabs_table')
+            links = table.find_all('a')
         for link in links:
             link_text = link.get_text(strip=True)
             link_text = link_text.lower().replace("ё", "е")
-            if link_text == track:
+            if track in link_text:
                 track_link = link
                 if track_link:
                     track_href = track_link.get('href')
@@ -273,35 +285,61 @@ def get_text_and_chords(artist, track, site):
         track_url = f"https://www.muzbar.ru{track_href}"
         if site == "oduvanchik":
             track_url = f"https://www.oduvanchik.net/{track_href}"
-        print(track_url)
+        elif site == "mytabs":
+            track_url = f"https://mytabs.ru{track_href}"
+        print("Track's url is found: ",track_url)
         response = requests.get(track_url)
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'html.parser')
             text_and_chords_div = soup.find('div', class_='chords')
             if text_and_chords_div:
                 pre_tags = text_and_chords_div.find_all('pre')
-            if site == "oduvanchik":
+            if site == "oduvanchik" or "mytabs":
                 pre_tags = soup.find_all('pre')
+                for pre_tag in pre_tags:
+                    text = pre_tag.get_text().replace('\n', '\n')
+                    return text
             text_and_chords = '\n\n'.join(pre_tag.get_text(strip=True) for pre_tag in pre_tags)
             return text_and_chords
     else:
         return None
 
+def is_cyrillic(char):
+    return unicodedata.name(char).find('CYRILLIC') >= 0
+
+def transliterate_letter(letter):
+    if letter.isalpha():
+        return translit(letter, 'ru', reversed=True).lower()
+    else:
+        return letter
+
 def get_artist_link(artist, site):
-    letter = artist[0]
+    first_word = artist.split()[0]
+    letter = first_word[0]
     if site == "oduvanchik":
         letter = letter.upper()
         letter_bytes = letter.encode('cp1251')
         letter_hex = letter_bytes.hex().upper()
         letter = urllib.parse.quote_plus('{}'.format(letter_hex))
+    elif site == "mytabs":
+        if is_cyrillic(letter):
+            letter = transliterate_letter(letter)
+            if len(letter) == 1:
+                letter = f"{letter}-r"
     if letter.isdigit():
         letter = "other"
-        if site == "oduvanchik":
+        if site == "oduvanchik" or "mytabs":
             letter = "0-9"
 
     letter_url = f"https://www.muzbar.ru/tabs/?letter={letter}"
     if site == "oduvanchik":
         letter_url = f"https://www.oduvanchik.net/art_ltr.php?id=%{letter}"
+    elif site == "mytabs":
+        letter_url = f"https://mytabs.ru/akkordy/{letter}"
+    if letter_url:
+        print(f"{letter}-letter's url is found: ", letter_url)
+    else:
+        print(f"{letter}-letter's is not found.")
 
     response = requests.get(letter_url)
     if response.status_code == 200:
@@ -332,8 +370,41 @@ def get_artist_link(artist, site):
                                 artist_href = artist_link.get('href')
                                 return artist_href
 
+        elif site == "mytabs":
+            current_page = 1
+            while True:
+                if current_page > 1:
+                    letter_url = f"https://mytabs.ru/akkordy/{letter}?page={current_page}"
+                    response = requests.get(letter_url)
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.content, 'html.parser')
+                artists_table_div = soup.find('div', class_='table-responsive')
+                if artists_table_div:
+                    links = artists_table_div.find_all('a')
+                    for link in links:
+                        link_text = link.get_text(strip=True)
+                        link_text = link_text.lower().replace("ё", "е")
+                        if link_text == artist:
+                            artist_link = link
+                            if artist_link:
+                                artist_href = artist_link.get('href')
+                                # print("Artist's href is", artist_href)
+                                return artist_href
+                pagenavi = soup.find('div', class_='wp-pagenavi')
+                if pagenavi:
+                    last_page_link = pagenavi.find_all('a')[-2]
+                    max_page = 0
+                    if last_page_link and last_page_link.get_text().isdigit():
+                        max_page = int(last_page_link.get_text())
+                    else:
+                        break
+                    print(f"Find artist: page {current_page} of {max_page}")
+                    if current_page >= max_page:
+                        break
+                current_page += 1
+
 def play_track(track):
-    global track_finished, track_passed, artist_aborted, next_searched, new_track
+    global track_finished, track_passed, artist_aborted, next_searched, new_track, chords_modified, tonality
     while True:
         if isinstance(track.get('artist'), dict):
             artist_name = track['artist'].get('name', '')
@@ -348,24 +419,41 @@ def play_track(track):
         print("Album: ", album)
 
         scrobbled = False
-        input_thread = threading.Thread(target=input_listener)
-        input_thread.start()
         if not new_track:
             users_track_info(artist_name, track['name'])
 
-        text_and_chords = get_text_and_chords(artist_name, track['name'], "muzbar")
+        text_and_chords = get_text_and_chords(artist_name, track['name'], "mytabs")
         if not text_and_chords:
-            text_and_chords = get_text_and_chords(artist_name, track['name'], "oduvanchik")
-        print(text_and_chords)
+            text_and_chords = get_text_and_chords(artist_name, track['name'], "muzbar")
+            if not text_and_chords:
+                text_and_chords = get_text_and_chords(artist_name, track['name'], "oduvanchik")
 
+        input_thread = None
+        if text_and_chords:
+            pydoc.pager(text_and_chords)
+        else:
+            print("Text and chords are not found.")
+        if input_thread:
+            input_thread.join()
+        input_thread = threading.Thread(target=input_listener)
+        input_thread.start()
+
+        modified_chords_displayed = False
         while not track_finished:
+            if chords_modified and not modified_chords_displayed:
+               text_and_chords = modify_chords(text_and_chords, tonality)
+               print(text_and_chords)
+               modified_chords_displayed = True
+
             update_now_playing(artist_name, track['name'], album)
             if track_finished:
                 break
             time.sleep(1)
 
         if track_finished:
+            print("Track is finishing...")
             if artist_aborted:
+                print("Artist is aborting...")
                 key = artist_name
                 if key in played_tracks:
                     aborted_artists[key] += 1
@@ -381,6 +469,7 @@ def play_track(track):
                 track_finished = False
                 track = get_similar_artist_track(artist_name)
             elif next_searched:
+                print("Searching of next track...")
                 if not track_passed:
                     print("\nScrobbling... ")
                     scrobble_track(artist_name, track['name'], album)
@@ -402,6 +491,7 @@ def play_track(track):
                     add_to_played_tracks(artist_name, track['name'], scrobbled)
                     similar_track = search_similar_track(track)
                 else:
+                    print("Track is passing...")
                     add_to_played_tracks(artist_name, track['name'], scrobbled)
                     previous_track = get_previous_track()
                     similar_track = search_similar_track(previous_track)
@@ -412,8 +502,9 @@ def play_track(track):
             break
 
 def input_listener():
-    global track_finished, track_passed, artist_aborted, next_searched
+    global track_finished, track_passed, artist_aborted, next_searched, chords_modified, tonality
     user_input = input()
+    print("Your input is", user_input)
     while not track_finished:
 
         if user_input.lower() == 'q':
@@ -435,6 +526,43 @@ def input_listener():
             track_passed = True
             track_finished = True
             next_searched = True
+        elif user_input.startswith('m '):
+            try:
+                tonality = int(user_input.split()[1])
+                chords_modified = True
+            except (IndexError, ValueError):
+                print("Invalid input. Please use 'm <number>' format.")
+        else:
+            print("Invalid input. Please try again.")
+        user_input = input()
+
+def modify_chords(text_and_chords, tonality):
+    chord_mapping = {
+        "A": 0, "B": 1, "H": 2, "C": 3, "C#": 4, "D": 5, "D#": 6, "E": 7, "F": 8, "F#": 9, "G": 10, "G#": 11
+    }
+
+    soup = BeautifulSoup(text_and_chords, 'html.parser')
+    text = soup.get_text(strip=True)
+    chords = soup.find_all('span', class_='chords')
+
+    modified_chords = []
+
+    for chord in chords:
+        chord_name = chord.text
+        root_note = chord_name[0]
+        if root_note not in chord_mapping:
+            continue
+        note_index = chord_mapping[root_note]
+        modified_index = (note_index + tonality) % 12
+
+        for note, index in chord_mapping.items():
+            if index == modified_index:
+                modified_name = note + chord_name[1:]
+                break
+        modified_chord = f"<span class=\"chord\"data-chid=\"{chord['data-chid']}\">{modified_name}</span>"
+        modified_chords.append(modified_chord)
+    modified_text = text + "\n\n" + "\n".join(modified_chords)
+    return modified_text
 
 # def play_album(album):
 #     track_list = get_album_tracks(album)
@@ -583,10 +711,14 @@ def search_similar_track(track):
         }
     print("\nSearching next track... ")
     response = requests.get(url, params=params).json()
-    similar_tracks = response['similartracks']['track']
+    if response.get('similartracks'):
+        similar_tracks = response['similartracks']['track']
+    else:
+        similar_artist_track = get_similar_artist_track(artist_name)
+        return similar_artist_track 
+
 
     if not similar_tracks:
-        # print("Fail.\nSearching similar artist... ")
         similar_track = extract_similar_track_from_html(artist_name, track['name'])
         if not similar_track:
             similar_artist_track = get_similar_artist_track(artist_name)
@@ -602,14 +734,15 @@ def search_similar_track(track):
 
     for similar_track in similar_tracks:
         key = f"{similar_track['artist']['name']} - {similar_track['name']}"
-        # print("key: ", key)
-        # print("played_tracks: ", played_tracks)
-        if key not in played_tracks:
+        key_lower = key.lower()
+        print("key: ", key_lower)
+        print("played_tracks: ", played_tracks)
+        if key_lower not in played_tracks:
             print(f"\nNext track is similar on track: {similar_track['artist']['name']} - {similar_track['name']}")
             return similar_track
 
 def get_random_loved_track():
-    # print("Searching random loved track... ")
+    print("Searching random loved track... ")
     url = "http://ws.audioscrobbler.com/2.0/?method=user.getlovedtracks"
     user = username
     params = {
@@ -626,7 +759,7 @@ def get_random_loved_track():
     response = requests.get(url, params=params).json()
     track_list = response['lovedtracks']['track']
     random_track = random.choice(track_list)
-    # print("OK")
+    print("OK")
     return random_track
 
 def extract_similar_track_from_html(artist, track):
@@ -653,41 +786,40 @@ def extract_similar_track_from_html(artist, track):
                     return similar_track
 
 def get_similar_artist_track(artist):
-    artist_params = {
-            "api_key": api_key,
-            "artist": artist,
-            "limit": 12,
-            "format": "json"
-            }
-    similar_artist_response = requests.get("http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar", params=artist_params).json()
-    similar_artists = similar_artist_response['similarartists']['artist']
-
-    if not similar_artists:
-        similar_artists = extract_similar_artist_from_html(artist)
-
-    for artist in similar_artists:
-        # print(artist)
-        if 'artist' in artist:
-            artist_name = artist['artist']
-        else:
-            artist_name = artist['name']
-        key = f"{artist_name}"
-        # print(artist_name)
-        if key not in aborted_artists:
-            top_tracks_params = {
+    if artist != 'None':
+        artist_params = {
                 "api_key": api_key,
-                "artist": artist_name,
-                "limit": 6,
+                "artist": artist,
+                "limit": 12,
                 "format": "json"
                 }
-            top_tracks_response = requests.get("http://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks", params=top_tracks_params).json()
-            top_tracks = top_tracks_response['toptracks']['track']
+        similar_artist_response = requests.get("http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar", params=artist_params).json()
+        similar_artists = similar_artist_response['similarartists']['artist']
 
-            for top_track in top_tracks:
-                key = f"{top_track['artist']['name']} - {top_track['name']}"
-                if key not in played_tracks:
-                    # print("OK")
-                    return top_track
+        if not similar_artists:
+            similar_artists = extract_similar_artist_from_html(artist)
+
+        for artist in similar_artists:
+            if 'artist' in artist:
+                artist_name = artist['artist']
+            else:
+                artist_name = artist['name']
+            key = f"{artist_name}"
+            if key not in aborted_artists:
+                top_tracks_params = {
+                    "api_key": api_key,
+                    "artist": artist_name,
+                    "limit": 6,
+                    "format": "json"
+                    }
+                top_tracks_response = requests.get("http://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks", params=top_tracks_params).json()
+                top_tracks = top_tracks_response['toptracks']['track']
+
+                for top_track in top_tracks:
+                    key = f"{top_track['artist']['name']} - {top_track['name']}"
+                    if key not in played_tracks:
+                        # print("OK")
+                        return top_track
 
 def extract_similar_artist_from_html(artist):
     similar_artists = []
@@ -784,6 +916,7 @@ def main():
         #     play_user(user)
 
         else:
+            add_to_played_tracks(None, None, False)
             track = get_random_loved_track()
             play_track(track)
     except pylast.NetworkError as e:
